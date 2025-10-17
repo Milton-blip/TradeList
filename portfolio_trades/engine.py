@@ -121,6 +121,42 @@ def build_trades_and_afterholdings(
         cur = cur_val.reindex(sleeves).fillna(0.0)
         tgt = tgt_val.reindex(sleeves).fillna(0.0)
 
+        # ---- Consolidate sleeves to a single account when tiny ----
+        # Goal: avoid establishing tiny new positions in multiple accounts.
+        # Rule: pick a single "preferred" account per sleeve (the account that
+        # already holds the most $ in that sleeve). In *non-preferred* accounts,
+        # if the target $ for that sleeve is below MIN_POS_DOLLARS, freeze it
+        # at current $ (i.e., no change), so the sleeve concentrates.
+        MIN_POS_DOLLARS = 5000.0  # tweak if you want a different threshold
+
+        # Build preferred-account map once per portfolio (memoize on outer scope)
+        # Cache name: _preferred_acct_by_sleeve
+        if not hasattr(build_trades_and_afterholdings, "_preferred_acct_by_sleeve"):
+            sleeve_acct_values = (
+                df.groupby(["Sleeve", "Account"])["Value"].sum().reset_index()
+            )
+            # pick the account with the largest $ for each sleeve
+            idx = sleeve_acct_values.groupby("Sleeve")["Value"].idxmax()
+            pref = (
+                sleeve_acct_values.loc[idx, ["Sleeve", "Account"]]
+                .set_index("Sleeve")["Account"]
+                .to_dict()
+            )
+            setattr(build_trades_and_afterholdings, "_preferred_acct_by_sleeve", pref)
+
+        preferred_by_sleeve = getattr(build_trades_and_afterholdings, "_preferred_acct_by_sleeve")
+
+        # For each sleeve in this account: if this account is NOT preferred and
+        # target $ is tiny, then freeze it at current $ to avoid creating fragments.
+        for sname in sleeves:
+            if sname == "Illiquid_Automattic":
+                continue
+            pref_acct = preferred_by_sleeve.get(sname)
+            # Only suppress in non-preferred accounts
+            if pref_acct and pref_acct != acct:
+                if float(tgt.loc[sname]) > 0.0 and float(tgt.loc[sname]) < MIN_POS_DOLLARS:
+                    tgt.loc[sname] = float(cur.loc[sname])  # no change here; let preferred acct absorb it
+
         # Keep illiquid fixed
         if "Illiquid_Automattic" in cur.index:
             tgt.loc["Illiquid_Automattic"] = cur.loc["Illiquid_Automattic"]
