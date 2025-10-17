@@ -118,8 +118,9 @@ def build_trades_and_afterholdings(h: pd.DataFrame, W: pd.Series, cash_tolerance
 
     by_sleeve_ident = df.groupby(["Sleeve","_ident"])["Value"].sum().reset_index()
     canon_global = {}
-    sleeves_all = sorted(set(list(W_inv.index) + df["Sleeve"].unique().tolist()))
-    for s in sleeves_all:
+    sleeves_from_targets = [str(x) for x in list(W_inv.index) if isinstance(x,str) or str(x)!="nan"]
+sleeves_from_holdings = df["Sleeve"].dropna().astype(str).tolist()
+sleeves_all = sorted(set(sleeves_from_targets + sleeves_from_holdings))for s in sleeves_all:
         g = by_sleeve_ident[by_sleeve_ident["Sleeve"] == s]
         if not g.empty:
             canon_global[s] = g.sort_values("Value", ascending=False)["_ident"].iloc[0]
