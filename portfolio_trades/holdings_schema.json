@@ -1,0 +1,34 @@
+{
+  "columns": [
+    "Symbol",
+    "Name",
+    "Account",
+    "TaxStatus",
+    "Quantity",
+    "PricePerShare",
+    "MarketValue",
+    "CostPerShare",
+    "TotalCost",
+    "Sleeve",
+    "Tradable",
+    "Notes"
+  ],
+  "types": {
+    "Symbol": "str",
+    "Name": "str",
+    "Account": "str",
+    "TaxStatus": "str",
+    "Quantity": "float",
+    "PricePerShare": "float",
+    "MarketValue": "float",
+    "CostPerShare": "float",
+    "TotalCost": "float",
+    "Sleeve": "str",
+    "Tradable": "bool",
+    "Notes": "str"
+  },
+  "constraints": {
+    "MarketValue": "≈ Quantity * PricePerShare",
+    "TotalCost":   "≈ Quantity * CostPerShare"
+  }
+}

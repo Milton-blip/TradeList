@@ -1,0 +1,20 @@
+# .gitignore
+# Confidential / local-only data
+
+# Portfolio Data
+holdings.csv
+portfolio_data/
+
+# Outputs
+outputs/
+portfolio_targets/
+
+# Miscellaneous
+*.pdf
+*.csv
+*.xlsx
+
+# Environment / build artifacts
+.venv/
+__pycache__/
+*.pyc

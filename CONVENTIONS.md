@@ -1,0 +1,13 @@
+- Holdings columns: Symbol, Name, Account, TaxStatus, Quantity, PricePerShare, MarketValue, CostPerShare, TotalCost, Sleeve, Tradable, Notes
+- PricePerShare = market price per share
+- CostPerShare = average cost per share
+- MarketValue = Quantity × PricePerShare
+- TotalCost = Quantity × CostPerShare
+- Trade deltas = change in shares (not $)
+- CapGain = (PricePerShare - CostPerShare) × SharesSold
+- No cross-account transfers; each account self-finances buys/sells.
+- Cash tolerance = $100.
+- Automattic in WING Trust: Tradable=FALSE (illiquid, never sold).
+- Always use Unicode font (fonts.py) in PDF output.
+- Avoid illegal identifiers like “delta_$”.
+- All per-account trades must balance within tolerance.

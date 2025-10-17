@@ -1,0 +1,77 @@
+diff --git a/portfolio_trades/io_utils.py b/portfolio_trades/io_utils.py
+index 1111111..2222222 100644
+--- a/portfolio_trades/io_utils.py
++++ b/portfolio_trades/io_utils.py
+@@ -1,6 +1,7 @@
+ from pathlib import Path
+ import datetime
+ import pandas as pd
++import numpy as np
+
+ SCENARIOS = ["Base","Disinflation","Reflation","HardLanding","Stagflation","Geopolitical"]
+
+@@ -34,18 +35,48 @@ def load_holdings(path: str) -> pd.DataFrame:
+     if not found:
+         tried = "\n  ".join(str(p.resolve()) for p in candidates)
+         raise SystemExit(f"holdings.csv not found. Tried:\n  {tried}")
+-
+-    df = pd.read_csv(found)
+-    # No renaming here: we assume columns already follow your chosen names:
+-    # Symbol, Name, Account, TaxStatus, Quantity, PricePerShare, MarketValue, CostPerShare, TotalCost, Sleeve, Tradable, Notes
+-    rename_map = {
+-        "MarketValue": "Value",
+-        "CurrentValue": "Value",
+-        "CurrValue": "Value",
+-    }
+-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+-    return df
++    df = pd.read_csv(found)
++
++    # --- Robust column normalization ---
++    # Expect (case-insensitive, flexible):
++    # Symbol, Name, Account, TaxStatus, Quantity, PricePerShare, MarketValue, CostPerShare, TotalCost, Sleeve, Tradable
++    rename_map = {
++        # value dollar column (not used for trade math; we recompute from Quantity*Price)
++        "marketvalue": "Value",
++        "currentvalue": "Value",
++        "currvalue": "Value",
++        # price per share
++        "pricepershare": "Price",
++        "currentprice": "Price",
++        "lastprice": "Price",
++        "price": "Price",
++        # average cost per share
++        "costpershare": "AverageCost",
++        "avgcost": "AverageCost",
++        "averagecost": "AverageCost",
++        # total cost (not the same as AverageCost)
++        "totalcost": "TotalCost",
++    }
++    lower = {c.lower(): c for c in df.columns}
++    for k_lower, std in rename_map.items():
++        if k_lower in lower:
++            df.rename(columns={lower[k_lower]: std}, inplace=True)
++
++    # Required columns check
++    required = ["Symbol","Name","Account","TaxStatus","Quantity","Price","AverageCost"]
++    missing = [c for c in required if c not in df.columns]
++    if missing:
++        raise SystemExit(f"holdings.csv missing required columns: {missing}")
++
++    # Numeric coercion (per-share fields!)
++    for c in ["Quantity", "Price", "AverageCost"]:
++        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
++
++    # Compute Value and TotalCost if absent or stale
++    if "Value" not in df.columns:
++        df["Value"] = df["Quantity"] * df["Price"]
++    if "TotalCost" not in df.columns:
++        df["TotalCost"] = df["Quantity"] * df["AverageCost"]
++
++    # Sleeve / Tradable defaults
++    if "Sleeve" not in df.columns:
++        df["Sleeve"] = "US_Core"
++    if "Tradable" not in df.columns:
++        df["Tradable"] = True
++    df["Tradable"] = df["Tradable"].fillna(True).astype(bool)
++    return df

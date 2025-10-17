@@ -1,0 +1,14 @@
+diff --git a/portfolio_trades/engine.py b/portfolio_trades/engine.py
+index 7c9e20a..c4b27e1 100644
+--- a/portfolio_trades/engine.py
++++ b/portfolio_trades/engine.py
+@@ -425,7 +425,8 @@ def build_trades_and_afterholdings(df: pd.DataFrame, W: pd.Series, cash_tolerance: float = 100.0):
+         residuals.append((acct, net_cash))
+
+     # --- Return final results ---
+-    return tx, after, residuals
++    return tx, after, residuals
++
+
+ # ----------------------------------------------------------------------
+ # Helper functions (if needed later)

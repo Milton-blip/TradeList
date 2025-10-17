@@ -1,0 +1,224 @@
+diff --git a/portfolio_trades/engine.py b/portfolio_trades/engine.py
+index aaa000..bbb111 100644
+--- a/portfolio_trades/engine.py
++++ b/portfolio_trades/engine.py
+@@ -1,15 +1,27 @@
+ import math
+ import numpy as np
+ import pandas as pd
++from collections import defaultdict
+
+ CASH_SYMBOLS = {"SPAXX","FDRXX","VMFXX","BIL","CASH"}
+
+ def is_cash(sym: str) -> bool:
+     return str(sym).upper() in CASH_SYMBOLS
+
++def pick_account_cash_ident(df_acct: pd.DataFrame) -> str:
++    # Prefer an existing cash position; otherwise fallback to synthetic CASH
++    u = set(str(s).upper() for s in df_acct["Symbol"])
++    for c in ["SPAXX","FDRXX","VMFXX","BIL"]:
++        if c in u:
++            return c
++    return "CASH"
++
+ def is_automattic(symbol: str, name: str) -> bool:
+     s = str(symbol).strip().upper()
+     n = str(name).strip().upper()
+     return ("AUTOMATTIC" in n) or (s == "AUTOMATTIC")
+
++def tax_rate(status: str) -> float:
++    status = (status or "").strip().lower()
++    if "hsa" in status or "roth" in status: return 0.0
++    if "trust" in status: return 0.20
++    return 0.15
++
+ def round_shares(delta_dollars: float, price: float, ident: str) -> float:
+     if price <= 0: return 0.0
+     if is_cash(ident):  # cents
+@@ -22,28 +34,44 @@ def round_shares(delta_dollars: float, price: float, ident: str) -> float:
+     return round(delta_dollars/price, 1)
+
+ def build_trades_and_afterholdings(df: pd.DataFrame, W: pd.Series, cash_tolerance: float = 100.0):
+-    # Canonical identifier per (Account, Sleeve): pick largest $ holding; fallback to sleeve proxy if none
+-    df["_ident"] = df["Symbol"].astype(str)
+-    by_acct_sleeve = (df.groupby(["Account","Sleeve","_ident"])["Value"].sum().reset_index())
+-    canon = {}
+-    for (acct, sleeve), g in by_acct_sleeve.groupby(["Account","Sleeve"]):
+-        ident = g.sort_values("Value", ascending=False)["_ident"].iloc[0]
+-        canon[(acct, sleeve)] = ident
++    # Canonical identifier per (Account, Sleeve): pick largest $ holding
++    df["_ident"] = df["Symbol"].astype(str)
++    by_acct_sleeve = df.groupby(["Account","Sleeve","_ident"])["Value"].sum().reset_index()
++    canon = {(acct,slv): g.sort_values("Value",ascending=False)["_ident"].iloc[0]
++             for (acct,slv), g in by_acct_sleeve.groupby(["Account","Sleeve"])}
+
+     price_map = df.groupby("_ident")["Price"].median().to_dict()
+
+-    rows = []
++    rows: list[dict] = []
++    # Track current shares per (Account, Identifier) to cap sells
++    shares_map = df.groupby(["Account","_ident"])["Quantity"].sum().to_dict()
++    avgc_map   = df.groupby(["Account","_ident"]).apply(
++        lambda g: float((g["AverageCost"]*g["Quantity"]).sum() / max(1e-12, g["Quantity"].sum()))
++    ).to_dict()
+
+     # Build per-account targets, enforce budget neutrality by pushing remainder into Cash
+     for acct, dfA in df.groupby("Account", sort=False):
+         acct_total = float(dfA["Value"].sum())
+         if acct_total <= 0:
+             continue
+-        illq_mask = dfA.apply(lambda r: is_automattic(r["Symbol"], r["Name"]), axis=1)
++        # Illiquid (Automattic) value stays fixed
++        illq_mask = dfA.apply(lambda r: is_automattic(r["Symbol"], r["Name"]), axis=1)
+         illq_val = float(dfA.loc[illq_mask, "Value"].sum())
+-        investable = max(0.0, acct_total - illq_val)
++        investable = max(0.0, acct_total - illq_val)
+
+-        W_inv = W.copy()
++        # Compute account targets from portfolio-wide W, excluding illiquid sleeve if present
++        W_inv = W.copy()
+         if "Illiquid_Automattic" in W_inv.index:
+             W_inv = W_inv.drop(index="Illiquid_Automattic")
+         W_inv = W_inv / max(1e-12, W_inv.sum())
+-        tgt_val = (W_inv * investable)
++        tgt_val = (W_inv * investable)
++
++        # Current by sleeve (exclude illiquid from rebalancing pool)
++        cur_val = dfA.groupby("Sleeve")["Value"].sum()
++        cur_val = cur_val.reindex(W_inv.index).fillna(0.0)
++
++        # Dollar deltas by sleeve (target - current)
++        sleeve_delta = (tgt_val - cur_val).to_dict()
++
++        # Enforce per-account budget neutrality by absorbing residual into CASH
++        cash_ident = pick_account_cash_ident(dfA)
++        cash_sleeve = "Cash"
++        noncash_total = sum(v for s,v in sleeve_delta.items() if s != "Illiquid_Automattic")
++        # If cash sleeve not in W_inv (often true), add it so we can push remainder there
++        if cash_sleeve not in sleeve_delta:
++            sleeve_delta[cash_sleeve] = 0.0
++        # Force cash dollars to close the account: buys == sells
++        sleeve_delta[cash_sleeve] -= sum(v for s,v in sleeve_delta.items() if s != cash_sleeve)
+
+-        # Convert sleeve deltas to trades using canonical account-level identifiers
+-        for sleeve, d in (tgt_val - cur_val).items():
++        # Convert sleeve deltas to trades; skip illiquid
++        for sleeve, d in sleeve_delta.items():
+             if sleeve == "Illiquid_Automattic":
+                 continue
+-            if abs(d) < 5.0:
++            if abs(d) < 1.0:  # ignore dust
+                 continue
+
+-            ident = canon.get((acct, sleeve))
++            ident = canon.get((acct, sleeve), None)
++            if sleeve == cash_sleeve:
++                ident = cash_ident
+             if ident is None:
+                 continue
+             px = float(price_map.get(ident, 0.0))
+             if px <= 0:
+                 continue
+-            sh = round_shares(d, px, ident)
++            sh = round_shares(d, px, ident)
+
+             action = "BUY" if sh > 0 else "SELL"
+-            # Cap SELL shares at what the account actually holds for this ident
++            # Cap SELL shares at what the account actually holds for this ident
+             if action == "SELL":
+-                held = float(dfA.loc[dfA["_ident"]==ident, "Quantity"].sum())
++                held = float(shares_map.get((acct, ident), 0.0))
+                 if abs(sh) > held:
+                     sh = -held  # cannot sell more than we own
+-                    d = sh * px
++                    d = sh * px  # recalc dollars actually executed
+
+             avgc = float(avgc_map.get((acct, ident), 0.0))
+             capgain = 0.0
+             if action == "SELL":
+-                capgain = (px - avgc) * abs(sh)  # per-share basis
++                capgain = (px - avgc) * abs(sh)  # per-share basis (correct: uses AverageCost per share)
+
+             rows.append({
+                 "Account": acct,
+                 "Identifier": ident,
+                 "Sleeve": sleeve,
+                 "Action": action,
+                 "Shares_Delta": float(sh),
+                 "Price": px,
+                 "AverageCost": avgc,
+-                "Delta_$": float(d),
++                "Delta_$": float(sh * px),
+                 "CapGain_$": float(capgain),
+             })
+
+-    tx = pd.DataFrame(rows)
++    tx = pd.DataFrame(rows)
+     if tx.empty:
+         return tx, df.copy(), {}
+
+@@ -56,20 +84,50 @@ def build_trades_and_afterholdings(df: pd.DataFrame, W: pd.Series, cash_tolerance: float = 100.0):
+-    # Warn residual cash per account
+-    residuals = tx.groupby("Account")["Delta_$"].sum().to_dict()
+-    return tx, after, residuals
++    # --- Tight residual control: push any residual into cash line (post rounding/caps) ---
++    # Recompute per-account residual after we built tx (rounding may create imbalance).
++    residuals = tx.groupby("Account")["Delta_$"].sum().to_dict()
++
++    fix_rows = []
++    for acct, resid in residuals.items():
++        if abs(resid) <= cash_tolerance:
++            continue
++        # Add balancing trade in CASH
++        cash_ident = pick_account_cash_ident(df[df["Account"]==acct])
++        px = price_map.get(cash_ident, 1.0) or 1.0
++        sh = round_shares(-resid, px, cash_ident)
++        if sh == 0:
++            continue
++        fix_rows.append({
++            "Account": acct,
++            "Identifier": cash_ident,
++            "Sleeve": "Cash",
++            "Action": "BUY" if sh > 0 else "SELL",
++            "Shares_Delta": float(sh),
++            "Price": float(px),
++            "AverageCost": float(avgc_map.get((acct, cash_ident), px)),
++            "Delta_$": float(sh * px),
++            "CapGain_$": 0.0
++        })
++    if fix_rows:
++        tx = pd.concat([tx, pd.DataFrame(fix_rows)], ignore_index=True)
++        residuals = tx.groupby("Account")["Delta_$"].sum().to_dict()
++
++    # --- Build 'after' snapshot by applying share deltas ---
++    after = df.copy()
++    # ensure a row exists for cash ident if we added synthetic cash trades
++    need = []
++    have_keys = set(after["Account"].astype(str) + "||" + after["_ident"].astype(str))
++    for _, r in tx.iterrows():
++        k = f'{r["Account"]}||{r["Identifier"]}'
++        if k not in have_keys:
++            need.append({
++                "Account": r["Account"], "TaxStatus": df.loc[df["Account"]==r["Account"],"TaxStatus"].iloc[0],
++                "Name": r["Identifier"], "Symbol": r["Identifier"], "_ident": r["Identifier"],
++                "Sleeve": "Cash" if is_cash(r["Identifier"]) else "US_Core",
++                "Quantity": 0.0, "Price": price_map.get(r["Identifier"], 1.0) or 1.0,
++                "AverageCost": avgc_map.get((r["Account"], r["Identifier"]), 0.0),
++                "Value": 0.0
++            })
++    if need:
++        after = pd.concat([after, pd.DataFrame(need)], ignore_index=True)
++
++    share_deltas = tx.groupby(["Account","Identifier"])["Shares_Delta"].sum()
++    share_deltas = share_deltas.to_dict()
++    def apply_delta(g: pd.DataFrame) -> pd.DataFrame:
++        acct = g["Account"].iloc[0]; ident = g["_ident"].iloc[0]
++        sh = float(share_deltas.get((acct, ident), 0.0))
++        if sh != 0.0:
++            g = g.copy()
++            g["Quantity"] = g["Quantity"] + sh
++            g["Value"] = g["Quantity"] * g["Price"]
++        return g
++    after = after.groupby(["Account","_ident"], group_keys=False).apply(apply_delta)
++
++    return tx, after, residuals

@@ -1,0 +1,5 @@
+pandas
+numpy
+fpdf2
+fonttools
+requests
