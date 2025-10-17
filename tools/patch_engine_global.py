@@ -1,56 +1,11 @@
-# portfolio_trades/engine.py
-from __future__ import annotations
-import re
-from typing import Dict, Tuple
-import numpy as np
-import pandas as pd
+# tools/patch_engine_global.py
+from pathlib import Path
+import re, subprocess
 
-from .conventions import (
-    MAP_TO_SLEEVE,
-    FALLBACK_PROXY,
-    ACCOUNT_TAX_STATUS_RULES,
-    DEFAULT_TAX_STATUS,
-    EST_TAX_RATE,
-    is_cashlike,
-    is_automattic,
-)
+SRC = Path("portfolio_trades/engine.py")
+FUNC_NAME = "build_trades_and_afterholdings"
 
-# -------------------------
-# Helpers
-# -------------------------
-def assign_tax_status(acct: str) -> str:
-    if not isinstance(acct, str):
-        return DEFAULT_TAX_STATUS
-    low = acct.lower()
-    for pat, status in ACCOUNT_TAX_STATUS_RULES:
-        if re.search(pat, low):
-            return status
-    return DEFAULT_TAX_STATUS
-
-
-def map_sleeve(sym: str, name: str) -> str:
-    s = str(sym).upper().strip()
-    n = str(name).upper().strip()
-    if is_automattic(s, n):
-        return "Illiquid_Automattic"
-    if s in MAP_TO_SLEEVE:
-        return MAP_TO_SLEEVE[s]
-    if "INFLATION" in n:
-        return "TIPS"
-    if any(k in n for k in ["UST", "TREAS", "STRIP"]):
-        return "Treasuries"
-    return "US_Core"
-
-
-def _round_shares(dollars: float, px: float, ident: str) -> float:
-    if px <= 0:
-        return 0.0
-    return round(dollars / px, 2) if is_cashlike(ident) else round(dollars / px, 1)
-
-
-# -------------------------
-# Core engine
-# -------------------------
+new_func = r'''
 def build_trades_and_afterholdings(h: pd.DataFrame, W: pd.Series, cash_tolerance: float = 100.0):
     df = h.copy()
 
@@ -314,4 +269,17 @@ def build_trades_and_afterholdings(h: pd.DataFrame, W: pd.Series, cash_tolerance
     residuals = {a: float(v) for a,v in flow.items() if abs(v) > cash_tolerance}
 
     return tx, after, residuals
+'''
 
+def main():
+    txt = SRC.read_text()
+    pattern = re.compile(rf"def {FUNC_NAME}\(.*?\):.*?(?=\ndef |\Z)", re.S)
+    if not pattern.search(txt):
+        raise SystemExit(f"Could not locate {FUNC_NAME}() in {SRC}")
+    new_txt = pattern.sub(new_func.strip() + "\n\n", txt)
+    SRC.write_text(new_txt)
+    subprocess.run(["python", "-m", "py_compile", str(SRC)], check=True)
+    print(f"patched {SRC}: replaced {FUNC_NAME}() and passed syntax check")
+
+if __name__ == "__main__":
+    main()
