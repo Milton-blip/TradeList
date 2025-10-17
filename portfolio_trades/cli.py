@@ -1,141 +1,104 @@
 # portfolio_trades/cli.py
-"""
-CLI for PortfolioAnalytics2 trade generation.
-
-Workflow:
-  1) Load holdings and portfolio-wide target mix
-  2) Compute trades per account (no inter-account transfers)
-  3) Write CSV, holdings-after, and PDF summaries
-"""
-from pathlib import Path
+from __future__ import annotations
 import argparse
+from pathlib import Path
+import numpy as np
 import pandas as pd
 
-from .io_utils import (
-    load_holdings,
-    load_targets,
-    ensure_outdir,
-    write_csv,
-    write_holdings,
-    today_str,
-)
+from .io_utils import load_holdings, load_targets, ensure_outdir, write_csv, write_holdings, today_str
 from .engine import build_trades_and_afterholdings
 from .report_pdf import render_pdf
-from .conventions import DEFAULT_CASH_TOL
+from .conventions import EST_TAX_RATE
 
-
-def _tax_rate_from_status(status: str) -> float:
-    """
-    Robust 0% for Roth/HSA regardless of formatting; 20% Trust; 15% Taxable; 0% otherwise.
-    """
-    s = (status or "").strip().lower()
-    if "roth" in s or "hsa" in s:
+def _tax_rate_for_status(status: str) -> float:
+    """HSAs and Roth IRAs => 0% capital gains tax. Others via EST_TAX_RATE."""
+    s = (status or "").lower()
+    if "hsa" in s or "roth" in s:
         return 0.0
     if "trust" in s:
-        return 0.20
+        return EST_TAX_RATE.get("Trust", 0.20)
     if "taxable" in s:
-        return 0.15
+        return EST_TAX_RATE.get("Taxable", 0.15)
+    # Fallback: conservative 0 for unknown tax-advantaged labels, else taxable baseline
     return 0.0
 
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Generate per-account trade lists to reach the portfolio-wide target mix"
-    )
-    parser.add_argument(
-        "--vol",
-        type=float,
-        default=0.08,
-        help="Target volatility (e.g. 0.08 = 8%%)",  # '%%' escapes percent for argparse
-    )
-    parser.add_argument(
-        "--cash-tol",
-        type=float,
-        default=DEFAULT_CASH_TOL,
-        help="Per-account cash tolerance in $",
-    )
-    parser.add_argument(
-        "--holdings",
-        type=str,
-        default="data/holdings.csv",
-        help="Path to holdings CSV (default: data/holdings.csv)",
-    )
+    parser = argparse.ArgumentParser(prog="TradesList")
+    parser.add_argument("--vol", type=float, default=0.08, help="Target volatility (e.g. 0.08 = 8%%)")
+    parser.add_argument("--holdings", type=str, default="holdings.csv")
+    parser.add_argument("--outdir", type=str, default="outputs")
+    parser.add_argument("--cash-tol", type=float, default=100.0)
     args = parser.parse_args()
 
     vol_pct_tag = int(round(args.vol * 100))
     print(f"Target volatility: {vol_pct_tag}%")
 
-    # === Load inputs ===
-    h: pd.DataFrame = load_holdings(args.holdings)
+    outdir = ensure_outdir(args.outdir)
+
+    # Load inputs
+    h = load_holdings(args.holdings)
     W = load_targets(vol_pct_tag)
 
-    # === Engine ===
-    tx, after, residuals = build_trades_and_afterholdings(
-        h, W, cash_tolerance=args.cash_tol
-    )
+    # Build trades + after-holdings
+    tx, after, residuals = build_trades_and_afterholdings(h, W, cash_tolerance=args.cash_tol)
 
-    # === Outputs ===
-    outdir = ensure_outdir()
-    date = today_str()
+    # Write CSV outputs
     base = Path.cwd().name
-
-    # CSV (rename money columns to _$
-    tx_out = tx.rename(
-        columns={"Delta_Dollars": "Delta_$", "CapGain_Dollars": "CapGain_$"}
-    )
+    date = today_str()
     csv_out = outdir / f"{base}_Trades_{date}.csv"
-    write_csv(tx_out, csv_out)
+    after_out = outdir / f"holdings_aftertrades_{date}.csv"
+
+    tx_out = tx.copy()
+    # Normalize expected columns
+    expect_cols = ["Account","TaxStatus","Identifier","Sleeve","Action",
+                   "Shares_Delta","Price","AverageCost","Delta_Dollars","CapGain_Dollars"]
+    for c in expect_cols:
+        if c not in tx_out.columns:
+            tx_out[c] = 0.0 if c not in ["Account","TaxStatus","Identifier","Sleeve","Action"] else ""
+
+    write_csv(tx_out[expect_cols], csv_out)
     print(f"CSV written: {csv_out}")
 
-    hold_after_out = outdir / f"holdings_aftertrades_{date}.csv"
-    write_holdings(after, hold_after_out)
-    print(f"Holdings-after written: {hold_after_out}")
+    write_holdings(after, after_out)
+    print(f"Holdings-after written: {after_out}")
 
     # Residual cash warnings
-    for acct, amt in residuals.items():
-        sign = "-" if amt < 0 else ""
-        print(f"[WARN] Residual cash flow in '{acct}': {sign}${abs(amt):,.2f}")
+    for acct, v in residuals.items():
+        s = f"${abs(v):,.2f}"
+        s = f"({s})" if v < 0 else s
+        print(f"[WARN] Residual cash flow in '{acct}': {s}")
 
-    # === PDF ===
-    if not tx.empty:
-        tx_pdf = tx.copy()
-        tx_pdf["Buy_$"] = tx_pdf["Delta_Dollars"].where(tx_pdf["Action"] == "BUY", 0.0)
-        tx_pdf["Sell_$"] = (-tx_pdf["Delta_Dollars"]).where(
-            tx_pdf["Action"] == "SELL", 0.0
-        )
+    # Summaries for PDF
+    tx_num = tx_out.copy()
+    for c in ["Shares_Delta","Price","AverageCost","Delta_Dollars","CapGain_Dollars"]:
+        tx_num[c] = pd.to_numeric(tx_num[c], errors="coerce").fillna(0.0)
 
-        acc_sum = (
-            tx_pdf.groupby(["Account", "TaxStatus"], as_index=False)
-            .agg(
-                Total_Buys=("Buy_$", "sum"),
-                Total_Sells=("Sell_$", "sum"),
-                Net_CapGain=("CapGain_Dollars", "sum"),
-            )
-            .copy()
-        )
-        acc_sum["Est_Tax"] = acc_sum.apply(
-            lambda r: _tax_rate_from_status(r["TaxStatus"]) * r["Net_CapGain"], axis=1
-        )
+    # Per-account summary (buys, sells, realized gains, est tax)
+    def _buys(x):  return float(x[x > 0].sum())
+    def _sells(x): return float(-x[x < 0].sum())
 
-        by_status = (
-            tx_pdf.groupby("TaxStatus", as_index=False)
-            .agg(
-                Total_Buys=("Buy_$", "sum"),
-                Total_Sells=("Sell_$", "sum"),
-                Net_CapGain=("CapGain_Dollars", "sum"),
-            )
-            .copy()
-        )
-        by_status["Est_Tax"] = by_status.apply(
-            lambda r: _tax_rate_from_status(r["TaxStatus"]) * r["Net_CapGain"], axis=1
-        )
+    acc_sum = (
+        tx_num.groupby(["Account","TaxStatus"], as_index=False)
+              .agg(Total_Buys=("Delta_Dollars", _buys),
+                   Total_Sells=("Delta_Dollars", _sells),
+                   Net_CapGain=("CapGain_Dollars","sum"))
+    )
+    acc_sum["Est_TaxRate"] = acc_sum["TaxStatus"].apply(_tax_rate_for_status)
+    acc_sum["Est_Tax"] = acc_sum["Net_CapGain"] * acc_sum["Est_TaxRate"]
 
-        pdf_out = outdir / f"{base}_{vol_pct_tag}vol_{date}.pdf"
-        render_pdf(tx_out, acc_sum, by_status, vol_pct_tag, str(pdf_out))
-        print(f"PDF written: {pdf_out}")
-    else:
-        print("No trades; PDF skipped.")
+    # By-status rollup using the already-taxed per-account numbers
+    by_status = (
+        acc_sum.groupby("TaxStatus", as_index=False)
+               .agg(Total_Buys=("Total_Buys","sum"),
+                    Total_Sells=("Total_Sells","sum"),
+                    Net_CapGain=("Net_CapGain","sum"),
+                    Est_Tax=("Est_Tax","sum"))
+    )
 
+    # Render PDF
+    pdf_out = outdir / f"{base}_{vol_pct_tag}vol_{date}.pdf"
+    render_pdf(tx_out[expect_cols + ["Action"]], acc_sum, by_status, vol_pct_tag, str(pdf_out))
+    print(f"PDF written: {pdf_out}")
 
 if __name__ == "__main__":
     main()
