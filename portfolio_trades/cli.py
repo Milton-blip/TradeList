@@ -97,7 +97,12 @@ def main():
 
     # Render PDF
     pdf_out = outdir / f"{base}_{vol_pct_tag}vol_{date}.pdf"
-    render_pdf(tx_out[expect_cols + ["Action"]], acc_sum, by_status, vol_pct_tag, str(pdf_out))
+    
+    tx_out = tx_out.loc[:, ~tx_out.columns.duplicated(keep="first")].copy()
+    if "Action" in tx_out.columns:
+        tx_out = tx_out.drop(columns=["Action"])
+    tx_out["Action"] = np.where(tx_out["Shares_Delta"] >= 0, "BUY", "SELL")
+    render_pdf(tx_out, acc_sum, by_status, vol_pct_tag, str(pdf_out))
     print(f"PDF written: {pdf_out}")
 
 if __name__ == "__main__":
