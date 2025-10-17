@@ -1,0 +1,465 @@
+
+diff --git a/portfolio_trades/engine.py b/portfolio_trades/engine.py
+index 2b4aa6f..b9c0dc1 100644
+--- a/portfolio_trades/engine.py
++++ b/portfolio_trades/engine.py
+@@ -1,11 +1,13 @@
+ from __future__ import annotations
+ import re
+ from typing import Dict, Tuple
+ import numpy as np
+ import pandas as pd
+
+ from .conventions import (
+     MAP_TO_SLEEVE,
+     FALLBACK_PROXY,
+     ACCOUNT_TAX_STATUS_RULES,
+     DEFAULT_TAX_STATUS,
+     EST_TAX_RATE,
+     is_cashlike,
+     is_automattic,
+ )
+
+ # -------------------------
+ # Helpers
+ # -------------------------
+ def assign_tax_status(acct: str) -> str:
+     if not isinstance(acct, str):
+         return DEFAULT_TAX_STATUS
+     low = acct.lower()
+     for pat, status in ACCOUNT_TAX_STATUS_RULES:
+         if re.search(pat, low):
+             return status
+     return DEFAULT_TAX_STATUS
+
+
+ def map_sleeve(sym: str, name: str) -> str:
+     s = str(sym).upper().strip()
+     n = str(name).upper().strip()
+     if is_automattic(s, n):
+         return "Illiquid_Automattic"
+     if s in MAP_TO_SLEEVE:
+         return MAP_TO_SLEEVE[s]
+     if "INFLATION" in n:
+         return "TIPS"
+     if any(k in n for k in ["UST", "TREAS", "STRIP"]):
+         return "Treasuries"
+     return "US_Core"
+
+ def _round_shares(dollars: float, px: float, ident: str) -> float:
+     if px <= 0:
+         return 0.0
+     return round(dollars / px, 2) if is_cashlike(ident) else round(dollars / px, 1)
+
++def _tax_rate_for_status(status: str) -> float:
++    s = (status or "").lower()
++    if "hsa" in s or "roth" in s:
++        return 0.0
++    if "trust" in s:
++        return EST_TAX_RATE.get("Trust", 0.20)
++    if "taxable" in s:
++        return EST_TAX_RATE.get("Taxable", 0.15)
++    return 0.0
++
+
+ # -------------------------
+ # Core engine
+ # -------------------------
+ def build_trades_and_afterholdings(
+     h: pd.DataFrame,
+     W: pd.Series,
+     cash_tolerance: float = 100.0,
+ ):
+@@ -37,37 +39,66 @@ def build_trades_and_afterholdings(
+       Value (=Quantity*Price), Cost (=Quantity*AverageCost)
+     """
+     df = h.copy()
+
+     # Ensure TaxStatus
+     if "TaxStatus" not in df.columns or df["TaxStatus"].eq("").all():
+         df["TaxStatus"] = df["Account"].map(assign_tax_status)
+
+     # Sleeves and identifiers
+     df["Sleeve"] = [map_sleeve(s, n) for s, n in zip(df["Symbol"], df["Name"])]
+     df["_ident"] = df["Symbol"].astype(str)
+
+-    # Canonical ident to trade **within each account & sleeve** (pick largest $ there)
++    # Canonical ident to trade **within each account & sleeve** (pick largest $ there)
+     acct_sleeve_ident: Dict[Tuple[str, str], str] = (
+         df.groupby(["Account", "Sleeve", "_ident"])["Value"]
+         .sum()
+         .reset_index()
+         .sort_values(["Account", "Sleeve", "Value"], ascending=[True, True, False])
+         .drop_duplicates(["Account", "Sleeve"])
+         .set_index(["Account", "Sleeve"])["_ident"]
+         .to_dict()
+     )
+
+     # Price per ident
+     price_map = df.groupby("_ident")["Price"].median().to_dict()
+
+     # Total value per account (for sizing)
+     acct_total = df.groupby("Account")["Value"].sum()
+
++    # Account tax rate lookup
++    acct_tax = (
++        df.groupby(["Account", "TaxStatus"], as_index=False)
++          .size()
++          .assign(TaxRate=lambda x: x["TaxStatus"].apply(_tax_rate_for_status))
++          .set_index("Account")["TaxRate"].to_dict()
++    )
++
++    # Current $ by (Account, Sleeve) to aid consolidation and gain estimates
++    cur_by_acct_sleeve = df.groupby(["Account", "Sleeve"])["Value"].sum().to_dict()
++
++    # Sleeve preferred account: lowest tax rate, then most already held $ in that sleeve
++    sleeves = sorted(set(W.index) | set(df["Sleeve"].unique()))
++    sleeve_pref_acct: Dict[str, str] = {}
++    for slv in sleeves:
++        # build candidate list of accounts with tuple (tax, -current_value) to sort
++        candidates = []
++        for acct in df["Account"].unique():
++            tax = float(acct_tax.get(acct, 0.0))
++            held = float(cur_by_acct_sleeve.get((acct, slv), 0.0))
++            candidates.append((tax, -held, acct))
++        if candidates:
++            candidates.sort()
++            sleeve_pref_acct[slv] = candidates[0][2]
++
+     trades = []
++    unmet: Dict[str, float] = {slv: 0.0 for slv in sleeves}
+
+     # Target sizing is portfolio-wide; per-account invests only its investable pool
+     for acct, g in df.groupby("Account"):
+         total_val = float(acct_total.get(acct, 0.0))
+         if total_val <= 0:
+             continue
+
+         # Illiquid Automattic dollars in this account (held, not traded)
+         illq_val = g.loc[
+             [is_automattic(s, n) for s, n in zip(g["Symbol"], g["Name"])], "Value"
+         ].sum()
+
+         investable = max(0.0, total_val - float(illq_val))
+
+         # Remove illiquid from investable target weights
+         W_inv = W.copy()
+         if "Illiquid_Automattic" in W_inv.index:
+             W_inv = W_inv.drop(index="Illiquid_Automattic")
+         W_inv = W_inv / (W_inv.sum() if W_inv.sum() > 0 else 1.0)
+
+         tgt_val = W_inv * investable
+         cur_val = g.groupby("Sleeve")["Value"].sum()
+
+         sleeves_local = sorted(set(cur_val.index).union(tgt_val.index))
+         cur = cur_val.reindex(sleeves_local).fillna(0.0)
+         tgt = tgt_val.reindex(sleeves_local).fillna(0.0)
+
+         # Keep illiquid fixed
+         if "Illiquid_Automattic" in cur.index:
+             tgt.loc["Illiquid_Automattic"] = cur.loc["Illiquid_Automattic"]
+
+         # Sleeve deltas (dollars)
+-        delta = (tgt - cur)
++        delta = (tgt - cur)
+
+-        # Generate per-sleeve trades (excluding illiquid)
++        # Generate per-sleeve trades (excluding illiquid) with tax-aware consolidation:
++        #  - Buy only in the preferred account for the sleeve (and always OK in 0% tax accts)
++        #  - Sell only where gain per $ <= 0 or account has 0% tax
++        acct_tax_rate = float(acct_tax.get(acct, 0.0))
+         for sleeve, d_dollars in delta.items():
+             if sleeve == "Illiquid_Automattic":
+                 continue
+-            ident = acct_sleeve_ident.get((acct, sleeve))
+-            if ident is None:
+-                ident = FALLBACK_PROXY.get(sleeve)
+-            if ident is None:
+-                continue
++            ident = acct_sleeve_ident.get((acct, sleeve)) or FALLBACK_PROXY.get(sleeve)
++            if ident is None:
++                continue
+
+             px = float(price_map.get(ident, 0.0))
+             if not np.isfinite(px) or px <= 0:
+                 continue
+
+             # Skip micro-noise
+             if abs(d_dollars) < 1.0:
+                 continue
+
+-            sh = _round_shares(d_dollars, px, ident)
+-            if sh == 0.0:
+-                continue
++            # Consolidate buys
++            pref_acct = sleeve_pref_acct.get(sleeve)
++            allow_buy_here = (acct == pref_acct) or (acct_tax_rate == 0.0)
++            allow_sell_here = (acct_tax_rate == 0.0)  # always ok in 0% tax
++
++            # Estimate gain per $ for this sleeve in this account (rough, from ident avg cost)
++            rows_ident = g[g["_ident"] == ident]
++            if not rows_ident.empty and rows_ident["Quantity"].sum() > 0:
++                tot_sh = float(rows_ident["Quantity"].sum())
++                avgc = float(
++                    (rows_ident["AverageCost"] * rows_ident["Quantity"]).sum() / tot_sh
++                )
++            else:
++                avgc = 0.0
++            est_gain_per_dollar = (px - avgc) / px if px > 0 else 0.0
++            if est_gain_per_dollar <= 0:
++                allow_sell_here = True
++
++            # Apply heuristic gates
++            if d_dollars > 0 and not allow_buy_here:
++                unmet[sleeve] += d_dollars
++                continue
++            if d_dollars < 0 and not allow_sell_here:
++                unmet[sleeve] += d_dollars
++                continue
++
++            sh = _round_shares(d_dollars, px, ident)
++            if sh == 0.0:
++                continue
+
+             # SELLs cannot exceed shares in THIS account
+             if d_dollars < 0:
+                 held_sh = float(g.loc[g["_ident"] == ident, "Quantity"].sum())
+                 sh = -min(abs(sh), abs(held_sh))  # negative shares for sell
+                 if sh == 0.0:
+                     continue
+
+-            # Account-level weighted average cost per share for this ident
+-            rows_ident = g[g["_ident"] == ident]
+-            if not rows_ident.empty and rows_ident["Quantity"].sum() > 0:
+-                tot_sh = float(rows_ident["Quantity"].sum())
+-                avgc = float(
+-                    (rows_ident["AverageCost"] * rows_ident["Quantity"]).sum() / tot_sh
+-                )
+-            else:
+-                avgc = 0.0
+-
+             action = "BUY" if sh > 0 else "SELL"
+             capgain = (px - avgc) * abs(sh) if action == "SELL" else 0.0
+
+             trades.append(
+                 {
+                     "Account": acct,
+                     "TaxStatus": g["TaxStatus"].iloc[0],
+                     "Identifier": ident,
+                     "Sleeve": sleeve,
+                     "Action": action,
+                     "Shares_Delta": sh,
+                     "Price": px,           # per-share
+                     "AverageCost": avgc,   # per-share
+                     "Delta_Dollars": sh * px,
+                     "CapGain_Dollars": capgain,
+                 }
+             )
+
+         # ---------- Per-account CASH balancing ----------
+         # Make net dollars == 0 within this account by offsetting in CASH
+         if trades:
+             acct_trades = [t for t in trades if t["Account"] == acct]
+             net_flow = sum(t["Delta_Dollars"] for t in acct_trades)
+             if abs(net_flow) > cash_tolerance:
+                 cash_ident = acct_sleeve_ident.get((acct, "Cash")) or FALLBACK_PROXY.get("Cash", "BIL")
+                 cash_px = float(price_map.get(cash_ident, 1.0))
+                 if np.isfinite(cash_px) and cash_px > 0:
+                     sh_cash = _round_shares(-net_flow, cash_px, cash_ident)  # offset
+                     if sh_cash != 0.0:
+                         # Avg cost for cash is irrelevant for gains (no SELL capgain assumed)
+                         trades.append(
+                             {
+                                 "Account": acct,
+                                 "TaxStatus": g["TaxStatus"].iloc[0],
+                                 "Identifier": cash_ident,
+                                 "Sleeve": "Cash",
+                                 "Action": "BUY" if sh_cash > 0 else "SELL",
+                                 "Shares_Delta": sh_cash,
+                                 "Price": cash_px,
+                                 "AverageCost": 0.0,
+                                 "Delta_Dollars": sh_cash * cash_px,
+                                 "CapGain_Dollars": 0.0,
+                             }
+                         )
+@@ -127,6 +158,19 @@ def build_trades_and_afterholdings(
+                 ignore_index=True,
+             )
+
++    # Record unmet sleeve deltas (consolidation/tax guardrails may leave residuals)
++    unmet_warnings = {}
++    if len(unmet):
++        for slv, amt in unmet.items():
++            if abs(amt) > 1.0:
++                sign = "+" if amt > 0 else ""
++                unmet_warnings[f"Unmet target for sleeve {slv}"] = f"{sign}{amt:,.2f} $"
++
+     # Re-aggregate after inserting cash adjustments (so that net $/account ≈ 0)
+     if not tx.empty:
+         tx["_key"] = tx["Account"].astype(str) + "||" + tx["Identifier"].astype(str)
+         agg = (
+             tx.groupby(["Account", "Identifier", "TaxStatus", "Sleeve"], as_index=False)
+             .agg(
+                 Shares_Delta=("Shares_Delta", "sum"),
+                 Price=("Price", "last"),
+                 AverageCost=("AverageCost", "last"),
+                 Delta_Dollars=("Delta_Dollars", "sum"),
+                 CapGain_Dollars=("CapGain_Dollars", "sum"),
+                 Action=("Action", "last"),
+             )
+         )
+         agg["Action"] = np.where(agg["Shares_Delta"] >= 0, "BUY", "SELL")
+         tx = agg.copy()
+     else:
+         # Build a minimal after = input + sleeve and return early if no trades
+         after = df.copy()
+-        return tx, after, {}
++        return tx, after, {}
+
+     if tx.empty:
+         after = df.copy()
+         return tx, after, {}
+
+     # Aggregate per (Account, Identifier) after cash balancing
+     agg = (
+         tx.groupby(["Account", "Identifier", "TaxStatus", "Sleeve"], as_index=False)
+         .agg(
+             Shares_Delta=("Shares_Delta", "sum"),
+             Price=("Price", "last"),
+             AverageCost=("AverageCost", "last"),
+             Delta_Dollars=("Delta_Dollars", "sum"),
+             CapGain_Dollars=("CapGain_Dollars", "sum"),
+         )
+     )
+     agg["Action"] = np.where(agg["Shares_Delta"] >= 0, "BUY", "SELL")
+     tx = agg.copy()
+
+     # ---------- Build holdings-after by applying share deltas ----------
+     after = df.copy()
+     after["_key"] = after["Account"].astype(str) + "||" + after["_ident"].astype(str)
+
+     share_deltas = (
+         tx.assign(_key=tx["Account"].astype(str) + "||" + tx["Identifier"].astype(str))
+         .groupby("_key")["Shares_Delta"]
+         .sum()
+         .to_dict()
+     )
+
+     # Ensure any (Account, Identifier) traded but not held gets a placeholder row
+     have_keys = set(after["_key"])
+     need_keys = set(share_deltas.keys()) - have_keys
+     if need_keys:
+         inv_proxy = {v: k for k, v in FALLBACK_PROXY.items()}
+         add_rows = []
+         for k in need_keys:
+             acct, ident = k.split("||", 1)
+             sleeve_guess = inv_proxy.get(ident, "US_Core")
+             px = float(df.loc[df["_ident"] == ident, "Price"].median())
+             if not np.isfinite(px) or px <= 0:
+                 px = 1.0
+             add_rows.append(
+                 {
+                     "Account": acct,
+                     "TaxStatus": assign_tax_status(acct),
+                     "Name": ident,
+                     "Symbol": ident,
+                     "Sleeve": sleeve_guess,
+                     "_ident": ident,
+                     "Quantity": 0.0,
+                     "Price": px,
+                     "AverageCost": 0.0,
+                     "Value": 0.0,
+                     "Cost": 0.0,
+                     "_key": k,
+                 }
+             )
+         after = pd.concat([after, pd.DataFrame(add_rows)], ignore_index=True)
+
+     def _apply(group: pd.DataFrame) -> pd.DataFrame:
+         acct = group["Account"].iloc[0]
+         ident = group["_ident"].iloc[0]
+         k = f"{acct}||{ident}"
+         sh = float(share_deltas.get(k, 0.0))
+         if sh == 0.0:
+             return group
+         g = group.copy()
+         g.loc[:, "Quantity"] = g["Quantity"] + sh
+         g.loc[:, "Value"] = g["Quantity"] * g["Price"]
+         g.loc[:, "Cost"] = g["Quantity"] * g["AverageCost"]
+         return g
+
+-    after = after.groupby(["Account", "_ident"], group_keys=False).apply(_apply)
++    after = after.groupby(["Account", "_ident"], group_keys=False).apply(_apply)
+     after = after[after["Quantity"].abs() > 1e-9].copy()
+     after["Value"] = after["Quantity"] * after["Price"]
+     after["Cost"] = after["Quantity"] * after["AverageCost"]
+
+-    # Residuals (should be ~0 now; report only if we couldn’t balance cash)
+-
+-
+-flow = tx.groupby("Account")["Delta_Dollars"].sum()
+-residuals = {acct: float(v) for acct, v in flow.items() if abs(v) > cash_tolerance}
+-
+-
+-# --- Tax summary per account & tax status ---
+-def tax_rate_for_status(status: str) -> float:
+-    """
+-    Return the estimated capital gains tax rate for a given tax status.
+-    HSAs and Roth IRAs are tax-exempt (0%).
+-    """
+-    s = status.lower()
+-    if "hsa" in s or "roth" in s:
+-        return 0.0
+-    if "taxable" in s:
+-        return EST_TAX_RATE.get("Taxable", 0.15)
+-    if "trust" in s:
+-        return EST_TAX_RATE.get("Trust", 0.20)
+-    # fallback
+-    return 0.0
+-
+-
+-# compute tax per-account
+-acc_sum = (
+-    tx.groupby(["Account", "TaxStatus"], as_index=False)
+-    .agg(
+-        Total_Buys=("Delta_Dollars", lambda x: x[x > 0].sum()),
+-        Total_Sells=("Delta_Dollars", lambda x: -x[x < 0].sum()),
+-        Net_CapGain=("CapGain_Dollars", "sum"),
+-    )
+-)
+-acc_sum["Est_TaxRate"] = acc_sum["TaxStatus"].apply(tax_rate_for_status)
+-acc_sum["Est_Tax"] = acc_sum["Net_CapGain"] * acc_sum["Est_TaxRate"]
+-
+-# by tax status summary
+-# --- Summaries ---
+-acc_sum = (
+-    tx.groupby(["Account", "TaxStatus"], as_index=False)
+-    .agg(
+-        Total_Buys=("Total_Buys", "sum"),
+-        Total_Sells=("Total_Sells", "sum"),
+-        Net_CapGain=("Net_CapGain", "sum"),
+-        Est_Tax=("Est_Tax", "sum"),
+-    )
+-)
+-
+-by_status = (
+-    acc_sum.groupby("TaxStatus", as_index=False)
+-    .agg(
+-        Total_Buys=("Total_Buys", "sum"),
+-        Total_Sells=("Total_Sells", "sum"),
+-        Net_CapGain=("Net_CapGain", "sum"),
+-        Est_Tax=("Est_Tax", "sum"),
+-    )
+-)
+-
+-# Return full results
+-return tx, after, residuals
++    # Residuals (should be ~0 now; report only if we couldn’t balance cash)
++    flow = tx.groupby("Account")["Delta_Dollars"].sum()
++    residuals = {acct: float(v) for acct, v in flow.items() if abs(v) > cash_tolerance}
++    # Include unmet sleeve messages (if any)
++    for k, v in unmet_warnings.items():
++        residuals[k] = v
++
++    return tx, after, residuals
+PATCH
