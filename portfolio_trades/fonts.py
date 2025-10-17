@@ -1,36 +1,54 @@
+from __future__ import annotations
 from pathlib import Path
-import io, requests
-from fontTools.ttLib import TTFont
+import tempfile
+import shutil
+import requests
 
-FONT_DIR = Path(__file__).resolve().parent / "fonts_cache"
-FONT_PATH = FONT_DIR / "UnicodeSans.ttf"
+# Where the project keeps a canonical TTF we control
+PKG_DIR = Path(__file__).resolve().parent
+FONTS_DIR = PKG_DIR / "fonts"
+TTF_PATH = FONTS_DIR / "UnicodeSans.ttf"
+
+# A couple of reliable Unicode TTF sources
 FONT_URLS = [
     "https://github.com/google/fonts/raw/main/ofl/notosans/NotoSans-Regular.ttf",
     "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf",
-    "https://github.com/adobe-fonts/source-sans/raw/release/TTF/SourceSans3-Regular.ttf",
 ]
 
-def _valid_ttf_bytes(b: bytes) -> bool:
-    if len(b) < 4: return False
-    if b[:4] not in (b"\x00\x01\x00\x00", b"true", b"typ1", b"OTTO"): return False
-    TTFont(io.BytesIO(b))
-    return True
-
-def ensure_unicode_font() -> str:
-    FONT_DIR.mkdir(parents=True, exist_ok=True)
-    if FONT_PATH.exists():
-        try:
-            TTFont(str(FONT_PATH)); return str(FONT_PATH)
-        except Exception:
-            pass
-    last = None
+def _download_ttf(dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    last_err = None
     for url in FONT_URLS:
         try:
-            r = requests.get(url, timeout=20); r.raise_for_status()
-            if _valid_ttf_bytes(r.content):
-                with open(FONT_PATH, "wb") as f: f.write(r.content)
-                return str(FONT_PATH)
-            last = f"Invalid font at {url}"
+            r = requests.get(url, timeout=30, headers={"User-Agent": "python-requests"})
+            r.raise_for_status()
+            data = r.content
+            # cheap sanity check: TrueType/OTF magic
+            if len(data) >= 4 and data[:4] in (b"\x00\x01\x00\x00", b"OTTO", b"true", b"typ1"):
+                dst.write_bytes(data)
+                return
+            last_err = f"Invalid font bytes from {url}"
         except Exception as e:
-            last = f"{type(e).__name__}: {e}"
-    raise RuntimeError(f"Failed to fetch Unicode font. Last error: {last}")
+            last_err = f"{type(e).__name__}: {e}"
+    raise RuntimeError(f"Could not fetch a Unicode TTF. Last error: {last_err}")
+
+def ensure_unicode_ttf() -> Path:
+    """Ensure a Unicode TTF exists at TTF_PATH; return that path."""
+    if not TTF_PATH.exists() or TTF_PATH.stat().st_size < 1024:
+        _download_ttf(TTF_PATH)
+    return TTF_PATH
+
+def register_pdf_font(pdf) -> str:
+    """
+    Register the Unicode font with FPDF from a TEMPORARY COPY of the TTF.
+    This avoids FPDF trying to reuse any stale .pkl cache you might have near the repo file.
+    Returns the temp TTF path used.
+    """
+    ttf = ensure_unicode_ttf()
+    tmpdir = Path(tempfile.mkdtemp(prefix="fpdf_font_"))
+    tmp_ttf = tmpdir / "UnicodeSans.ttf"
+    shutil.copyfile(ttf, tmp_ttf)
+    # FPDF v1 API: add_font(name, style, fname, uni=True)
+    pdf.add_font("Unicode", "", str(tmp_ttf), uni=True)
+    pdf.set_font("Unicode", size=12)
+    return str(tmp_ttf)
